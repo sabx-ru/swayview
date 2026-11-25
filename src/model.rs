@@ -117,6 +117,7 @@ pub struct Output {
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
+    pub id: ConId,
     pub name: String,
     pub num: Option<i32>,
     /// Contains the focused window, or is itself focused (empty workspace).
@@ -276,6 +277,7 @@ fn workspace(node: &Node, output_rect: Rect) -> Workspace {
     let mut windows = c.windows;
     windows.sort_by_key(|w| w.floating);
     Workspace {
+        id: node.id,
         name: node.name_str().to_string(),
         num: node.num.filter(|n| *n >= 0),
         focused: node.focused || node.any_focused(),

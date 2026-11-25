@@ -8,6 +8,7 @@ mod render;
 mod sway;
 mod sway_config;
 mod wayland;
+mod workspace_move;
 
 use std::fmt::Display;
 
@@ -84,7 +85,7 @@ fn render_png(args: &Args, out: &str) -> Result<()> {
     let (w, h) = args.size.unwrap_or((output.rect.w as u32, output.rect.h as u32));
     let scene = layout::build(output, w as f32, h as f32);
     let selected = scene.focused_window();
-    let view = View { selected, selected_workspace: scene.selected_workspace(selected) };
+    let view = View { selected, selected_workspace: scene.selected_workspace(selected), drop_workspace: None, dragged_workspace: None, insertion: None };
     let pix = Renderer::new(config).draw(&scene, &view, w, h, 1.0).context("image size is zero")?;
     pix.save_png(out).with_context(|| format!("writing {out}"))?;
     Ok(())

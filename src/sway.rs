@@ -62,7 +62,9 @@ impl Ipc {
 
     pub fn command(&mut self, cmd: &str) -> Result<()> {
         let reply: serde_json::Value = serde_json::from_slice(&self.request(RUN_COMMAND, cmd)?)?;
-        for r in reply.as_array().into_iter().flatten() {
+        let replies = reply.as_array().context("invalid command reply")?;
+        ensure!(!replies.is_empty(), "empty command reply");
+        for r in replies {
             if r["success"] != true {
                 bail!("sway command {cmd:?} failed: {}", r["error"]);
             }
@@ -79,7 +81,7 @@ impl Ipc {
     }
 
     /// Blocks until the next subscribed event arrives.
-    pub fn wait_event(&mut self) -> Result<()> {
-        self.read_message().map(drop)
+    pub fn wait_event(&mut self) -> Result<(u32, Vec<u8>)> {
+        self.read_message()
     }
 }

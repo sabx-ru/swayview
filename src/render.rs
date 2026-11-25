@@ -26,6 +26,7 @@ const THUMB_RADIUS: f32 = WINDOW_RADIUS + 1.0;
 const LINE_HEIGHT: f32 = 1.3;
 const MIN_TEXT_WIDTH: f32 = 12.0;
 
+const SHOW_WORKSPACE_LABELS: bool = false;
 const WS_LABEL_SIZE: f32 = 16.0;
 const OUTPUT_LABEL_SIZE: f32 = 13.0;
 
@@ -69,6 +70,10 @@ pub struct View {
     /// The selected window, if it is on this scene.
     pub selected: Option<usize>,
     pub selected_workspace: Option<usize>,
+    /// Workspace tile under a dragged window.
+    pub drop_workspace: Option<usize>,
+    pub dragged_workspace: Option<usize>,
+    pub insertion: Option<(usize, bool)>,
 }
 
 pub struct Renderer {
@@ -94,7 +99,8 @@ impl Renderer {
     /// Renders at `scale` physical pixels per logical pixel; `None` if `w` or `h` is 0.
     pub fn draw(&mut self, scene: &Scene, view: &View, w: u32, h: u32, scale: f32) -> Option<Pixmap> {
         let mut pix = self.draw_workspaces(scene, view, w, h, scale)?;
-        for (i, win) in scene.windows.iter().enumerate() {
+        for i in scene.drawing_order() {
+            let win = &scene.windows[i];
             self.draw_window(&mut pix, win, win.rect, view.selected == Some(i), Behind::Nothing, scale);
         }
         Some(pix)
@@ -127,8 +133,22 @@ impl Renderer {
                 c.label
             };
             fill(&mut pix, ws.rect, (6.0, 6.0), c.fill, t);
+            if view.dragged_workspace == Some(i) {
+                stroke(&mut pix, ws.rect.inset(-3.0), (6.0, 6.0), colors.window.selected.border, 3.0, t);
+            }
+            if let Some((target, after)) = view.insertion
+                && target == i
+            {
+                let x = if after { ws.rect.x + ws.rect.w + 7.0 } else { ws.rect.x - 11.0 };
+                fill(&mut pix, Rect::new(x, ws.rect.y, 4.0, ws.rect.h), (2.0, 2.0), colors.window.selected.border, t);
+            }
+            if view.drop_workspace == Some(i) {
+                stroke(&mut pix, ws.rect, (6.0, 6.0), colors.window.selected.border, 3.0, t);
+            }
             let r = Rect::new(ws.header.x + 2.0, ws.header.y, ws.header.w - 4.0, HEADER);
-            self.text.draw(&mut pix, &[(&ws.name, fonts.app.style(WS_LABEL_SIZE, true, label))], r, scale);
+            if SHOW_WORKSPACE_LABELS {
+                self.text.draw(&mut pix, &[(&ws.name, fonts.app.style(WS_LABEL_SIZE, true, label))], r, scale);
+            }
         }
         Some(pix)
     }
@@ -410,7 +430,7 @@ mod tests {
     #[test]
     fn zero_size_is_none_not_a_panic() {
         let mut r = Renderer::new(Config::load(None));
-        let view = View { selected: None, selected_workspace: None };
+        let view = View { selected: None, selected_workspace: None, drop_workspace: None, dragged_workspace: None, insertion: None };
         assert!(r.draw(&Scene::default(), &view, 0, 10, 1.0).is_none());
         assert!(r.draw(&Scene::default(), &view, 10, 10, 1.0).is_some());
     }

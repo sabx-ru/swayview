@@ -11,6 +11,7 @@ const MAX_BOX: f32 = 0.5;
 
 #[derive(Debug, PartialEq)]
 pub struct WsItem {
+    pub id: ConId,
     pub name: String,
     pub header: Rect,
     pub rect: Rect,
@@ -47,8 +48,9 @@ pub struct Scene {
     /// Surface size the scene was laid out for.
     pub size: (f32, f32),
     pub workspaces: Vec<WsItem>,
-    /// Drawing order; the last one is on top.
+    /// Original navigation order.
     pub windows: Vec<WinItem>,
+    draw_order: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +142,7 @@ pub fn build(output: &Output, w: f32, h: f32) -> Scene {
             });
         }
         scene.workspaces.push(WsItem {
+            id: ws.id,
             name: ws.name.clone(),
             header: Rect::new(x, y, box_w, HEADER),
             rect,
@@ -147,6 +150,14 @@ pub fn build(output: &Output, w: f32, h: f32) -> Scene {
             urgent: ws.windows.iter().any(|w| w.urgent),
         });
     }
+    let mut order: Vec<usize> = (0..scene.windows.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&scene.windows[a], &scene.windows[b]);
+        a.workspace.cmp(&b.workspace).then_with(|| {
+            (b.rect.w * b.rect.h).total_cmp(&(a.rect.w * a.rect.h))
+        })
+    });
+    scene.draw_order = order;
     scene
 }
 
@@ -166,9 +177,33 @@ fn clip(r: Rect, to: Rect) -> Rect {
 }
 
 impl Scene {
+    pub fn workspace_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.workspaces.iter().position(|w| w.rect.contains(x, y) || w.header.contains(x, y))
+    }
+
+    /// Nearest tile, then left/right half. Works for rows and inter-tile gaps.
+    pub fn insertion_at(&self, x: f32, y: f32) -> Option<(usize, bool)> {
+        let distance = |r: Rect| {
+            let dx = (r.x - x).max(x - r.x - r.w).max(0.0);
+            let dy = (r.y - y).max(y - r.y - r.h).max(0.0);
+            dx * dx + dy * dy
+        };
+        let (i, w) = self.workspaces.iter().enumerate().min_by(|(_, a), (_, b)| {
+            distance(a.rect).total_cmp(&distance(b.rect))
+        })?;
+        Some((i, x >= w.rect.center().0))
+    }
+
     /// The topmost window at (`x`, `y`). The gap around a window counts as part of it.
+    pub fn drawing_order(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.draw_order.iter().copied()
+    }
+
     pub fn hit(&self, x: f32, y: f32) -> Option<usize> {
-        self.windows.iter().rposition(|w| w.rect.inset(-WINDOW_GAP / 2.0).contains(x, y))
+        self.drawing_order().rev().find(|&i| self.windows[i].rect.contains(x, y))
+            .or_else(|| self.drawing_order().rev().find(|&i| {
+                self.windows[i].rect.inset(-WINDOW_GAP / 2.0).contains(x, y)
+            }))
     }
 
     /// The workspace to mark as selected: the one holding window `selected`,
@@ -248,6 +283,29 @@ mod tests {
         let (a, b) = (&s.windows[0].rect, &s.windows[1].rect);
         let gap_x = (a.x + a.w + b.x) / 2.0;
         assert!(s.hit(gap_x, a.y + a.h / 2.0).is_some());
+    }
+
+    #[test]
+    fn small_windows_above_large_and_insertion_sides() {
+        let mut t = tree();
+        let o = &mut t.outputs[0];
+        let ws = &mut o.workspaces[0];
+        let mut small = ws.windows[0].clone();
+        small.id = ConId(10001);
+        small.rect = Rect::new(o.rect.x + 100.0, o.rect.y + 100.0, 300.0, 200.0);
+        small.floating = true;
+        let mut large = small.clone();
+        large.id = ConId(10002);
+        large.rect = o.rect;
+        ws.windows = vec![small.clone(), large.clone()];
+        let s = build(o, 1920.0, 1080.0);
+        let r = s.workspaces[0].rect;
+        assert_eq!(s.windows[0].rect, clip(o.rect.map_into(small.rect, r).inset(WINDOW_GAP / 2.0), r));
+        assert_eq!(s.drawing_order().filter(|&i| s.windows[i].workspace == 0).collect::<Vec<_>>(), [1, 0]);
+        let (x, y) = s.windows[0].rect.center();
+        assert_eq!(s.hit(x, y), Some(0));
+        assert_eq!(s.insertion_at(r.x + 1.0, r.center().1), Some((0, false)));
+        assert_eq!(s.insertion_at(r.x + r.w - 1.0, r.center().1), Some((0, true)));
     }
 
     #[test]

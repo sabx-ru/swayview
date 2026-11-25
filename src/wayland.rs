@@ -95,6 +95,22 @@ struct Surf {
     frame_pending: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Drag {
+    id: ConId,
+    source: usize,
+    source_workspace: usize,
+    start: (f32, f32),
+    active: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkspaceDrag {
+    id: ConId,
+    start: (f32, f32), // global logical coordinates
+    active: bool,
+}
+
 struct App {
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -126,6 +142,11 @@ struct App {
     pointer: Option<wl_pointer::WlPointer>,
     /// Surface under the pointer, known while it is over one of ours.
     pointer_surface: Option<usize>,
+    drag: Option<Drag>,
+    workspace_drag: Option<WorkspaceDrag>,
+    insertion: Option<(usize, usize, bool)>,
+    super_down: bool,
+    drop_workspace: Option<(usize, usize)>,
     tree_dirty: bool,
     exit: bool,
 }
@@ -149,8 +170,11 @@ pub fn run() -> Result<()> {
     event_loop
         .handle()
         .insert_source(sway_events, |event, (), app| {
-            if let channel::Event::Msg(()) = event {
-                app.tree_dirty = true;
+            if let channel::Event::Msg(message) = event {
+                match message {
+                    SwayNotice::TreeChanged => app.tree_dirty = true,
+                    SwayNotice::Swipe(direction) => app.workspace_swipe(direction),
+                }
             }
         })
         .map_err(|e| e.error)?;
@@ -176,16 +200,35 @@ pub fn run() -> Result<()> {
 }
 
 /// Sends a message for every sway event that may change what is shown.
-fn watch_sway() -> Result<Channel<()>> {
+#[derive(Clone, Copy, Debug)]
+enum SwayNotice {
+    TreeChanged,
+    Swipe(&'static str),
+}
+
+/// Receives workspace/window changes and specifically tagged swipe events.
+/// Sway's SEND_TICK/subscribe mechanism is used instead of a runtime file.
+fn watch_sway() -> Result<Channel<SwayNotice>> {
     let (tx, rx) = channel::channel();
     let mut ipc = Ipc::connect()?;
-    ipc.subscribe(&["window", "workspace"])?;
+    ipc.subscribe(&["window", "workspace", "output", "tick"])?;
     std::thread::spawn(move || {
         loop {
-            if let Err(e) = ipc.wait_event() {
-                return warn(e.context("event stream ended"));
-            }
-            if tx.send(()).is_err() {
+            let event = match ipc.wait_event() {
+                Ok((0x8000_0007, body)) => {
+                    let parsed = serde_json::from_slice::<serde_json::Value>(&body);
+                    let payload = parsed.ok().and_then(|v| v["payload"].as_str().map(str::to_owned));
+                    match payload.as_deref() {
+                        Some("swayview-workspace:left") => SwayNotice::Swipe("left"),
+                        Some("swayview-workspace:right") => SwayNotice::Swipe("right"),
+                        _ => continue,
+                    }
+                }
+                Ok((0x8000_0000 | 0x8000_0001 | 0x8000_0003, _)) => SwayNotice::TreeChanged,
+                Ok(_) => continue,
+                Err(e) => return warn(e.context("event stream ended")),
+            };
+            if tx.send(event).is_err() {
                 return;
             }
         }
@@ -210,7 +253,7 @@ fn view(scene: &Scene, selected: Option<Sel>, i: usize) -> View {
         Some(_) => window.map(|w| scene.windows[w].workspace),
         None => scene.selected_workspace(None),
     };
-    View { selected: window, selected_workspace: workspace }
+    View { selected: window, selected_workspace: workspace, drop_workspace: None, dragged_workspace: None, insertion: None }
 }
 
 /// Render scale and buffer size for a logical size at `scale` `SCALE_UNIT`s,
@@ -298,6 +341,11 @@ impl App {
             keyboard: None,
             pointer: None,
             pointer_surface: None,
+            drag: None,
+            workspace_drag: None,
+            insertion: None,
+            super_down: false,
+            drop_workspace: None,
             tree_dirty: false,
             exit: false,
         };
@@ -390,6 +438,9 @@ impl App {
     fn refresh(&mut self) {
         match self.ipc.get_tree() {
             Ok(mut tree) => {
+                if self.workspace_drag.is_some() && !crate::workspace_move::same_topology(&self.tree, &tree) {
+                    self.cancel_workspace_drag();
+                }
                 if let Some(focus) = &self.initial_focus {
                     tree.restore_focus(focus);
                 }
@@ -423,7 +474,11 @@ impl App {
         let Some((w, h)) = s.size else { return };
         let Some(renderer) = &mut self.renderer else { return };
         let (scale, (pw, ph)) = buffer_size((w, h), s.scale);
-        let view = view(&s.scene, self.selected, i);
+        let mut view = view(&s.scene, self.selected, i);
+        view.drop_workspace = self.drop_workspace.and_then(|(surface, ws)| (surface == i).then_some(ws));
+        view.dragged_workspace = self.workspace_drag.filter(|d| d.active)
+            .and_then(|d| s.scene.workspaces.iter().position(|w| w.id == d.id));
+        view.insertion = self.insertion.and_then(|(surface, ws, after)| (surface == i).then_some((ws, after)));
         let pix = if self.capture.is_some() {
             renderer.draw_workspaces(&s.scene, &view, pw, ph, scale)
         } else {
@@ -489,11 +544,164 @@ impl App {
     /// so a held key cannot run a sway command twice.
     fn key(&mut self, event: &KeyEvent, repeat: bool) {
         let Some(key) = key_of(event) else { return };
+        if self.workspace_drag.is_some() {
+            if matches!(key, Key::Escape) && !repeat {
+                self.cancel_workspace_drag();
+            }
+            return;
+        }
         if repeat && !matches!(key, Key::Arrow(_) | Key::Tab { .. }) {
             return;
         }
         let action = input::key(&self.scenes(), self.selected, key);
         self.apply(&action);
+    }
+
+    /// Position on the combined logical Sway desktop. Pointer coordinates can
+    /// exceed a source layer surface's size during an implicit button grab.
+    fn global_pointer(&self, source: usize, x: f32, y: f32) -> Option<(f32, f32)> {
+        let s = &self.surfaces[source].scene;
+        if s.size.0 <= 0.0 || s.size.1 <= 0.0 || s.output.is_empty() {
+            return None;
+        }
+        Some((s.output.x + x * s.output.w / s.size.0,
+              s.output.y + y * s.output.h / s.size.1))
+    }
+
+    /// Target output and workspace tile under global pointer position.
+    fn drop_target(&self, source: usize, x: f32, y: f32) -> (Option<usize>, Option<usize>) {
+        let Some((gx, gy)) = self.global_pointer(source, x, y) else {
+            return (None, None);
+        };
+        for (i, s) in self.surfaces.iter().enumerate() {
+            let scene = &s.scene;
+            if !scene.output.contains(gx, gy) || scene.output.is_empty() {
+                continue;
+            }
+            let px = (gx - scene.output.x) * scene.size.0 / scene.output.w;
+            let py = (gy - scene.output.y) * scene.size.1 / scene.output.h;
+            let workspace = scene.workspaces.iter().position(|w|
+                w.rect.contains(px, py) || w.header.contains(px, py));
+            return (Some(i), workspace);
+        }
+        (None, None)
+    }
+
+    fn cancel_workspace_drag(&mut self) {
+        self.workspace_drag = None;
+        self.insertion = None;
+        self.redraw_all();
+    }
+
+    fn insertion_target(&self, surface: usize, x: f32, y: f32) -> Option<(usize, usize, bool)> {
+        let (gx, gy) = self.global_pointer(surface, x, y)?;
+        let (i, s) = self.surfaces.iter().enumerate().find(|(_, s)| s.scene.output.contains(gx, gy))?;
+        let scene = &s.scene;
+        let px = (gx - scene.output.x) * scene.size.0 / scene.output.w;
+        let py = (gy - scene.output.y) * scene.size.1 / scene.output.h;
+        let (ws, after) = scene.insertion_at(px, py)?;
+        Some((i, ws, after))
+    }
+
+    fn workspace_drag_motion(&mut self, surface: usize, x: f32, y: f32) {
+        let Some(mut drag) = self.workspace_drag else { return; };
+        let Some((gx, gy)) = self.global_pointer(surface, x, y) else { return; };
+        let was_active = drag.active;
+        drag.active |= (gx - drag.start.0).hypot(gy - drag.start.1) > 6.0;
+        self.workspace_drag = Some(drag);
+        if drag.active {
+            let target = self.insertion_target(surface, x, y);
+            if !was_active || target != self.insertion {
+                self.insertion = target;
+                self.redraw_all();
+            }
+        }
+    }
+
+    fn workspace_drag_release(&mut self, surface: usize, x: f32, y: f32) {
+        let Some(drag) = self.workspace_drag else { return; };
+        let target = self.insertion_target(surface, x, y);
+        let active = drag.active || self.global_pointer(surface, x, y)
+            .is_some_and(|(gx, gy)| (gx - drag.start.0).hypot(gy - drag.start.1) > 6.0);
+        self.cancel_workspace_drag();
+        if !active {
+            self.apply(&Action::Close);
+            return;
+        }
+        let Some((i, ws, after)) = target else { return; };
+        let output = self.surfaces[i].output.clone();
+        let anchor = self.surfaces[i].scene.workspaces[ws].id;
+        if let Err(e) = crate::workspace_move::execute(&mut self.ipc, &self.tree, drag.id, &output, anchor, after) {
+            warn(e.context("moving workspace by drag"));
+        }
+        self.initial_focus = None;
+        self.refresh();
+    }
+
+    fn drag_motion(&mut self, surface: usize, x: f32, y: f32) {
+        let Some(mut drag) = self.drag else { return; };
+        if !drag.active {
+            let Some((gx, gy)) = self.global_pointer(surface, x, y) else { return; };
+            let Some((sx, sy)) = self.global_pointer(drag.source, drag.start.0, drag.start.1) else { return; };
+            drag.active = (gx - sx).hypot(gy - sy) > 6.0;
+        }
+        self.drag = Some(drag);
+        if drag.active {
+            let (target, ws) = self.drop_target(surface, x, y);
+            let new_drop = target.zip(ws);
+            if self.drop_workspace != new_drop {
+                self.drop_workspace = new_drop;
+                self.redraw_all();
+            }
+        }
+    }
+
+    fn drag_release(&mut self, surface: usize, x: f32, y: f32) {
+        let Some(drag) = self.drag.take() else { return; };
+        let old_drop = self.drop_workspace.take();
+        if old_drop.is_some() {
+            self.redraw_all();
+        }
+        if !drag.active {
+            // Short click retains the upstream focus/exit behaviour.
+            self.apply(&Action::Focus(drag.id));
+            return;
+        }
+        let (target, ws) = self.drop_target(surface, x, y);
+        let Some(target) = target else { return; };
+        let output = &self.surfaces[target].output;
+        let command = if let Some(ws) = ws {
+            if target == drag.source && ws == drag.source_workspace { return; }
+            let name = &self.surfaces[target].scene.workspaces[ws].name;
+            format!("[con_id={}] move container to workspace {}", drag.id,
+                serde_json::to_string(name).unwrap_or_default())
+        } else if target != drag.source {
+            format!("[con_id={}] move container to output {}", drag.id,
+                serde_json::to_string(output).unwrap_or_default())
+        } else {
+            return;
+        };
+        if let Err(e) = self.ipc.command(&command) {
+            warn(e.context("moving window by drag"));
+        }
+    }
+
+    fn workspace_swipe(&mut self, direction: &'static str) {
+        if self.workspace_drag.is_some() || self.drag.is_some() { return; }
+        let Some(i) = self.pointer_surface else { return; };
+        let output = self.surfaces[i].output.clone();
+        // The helper selects the output's *visible* workspace, not the global
+        // focused workspace, which can belong to another monitor under overlay.
+        let Some(home) = std::env::var_os("HOME") else { return; };
+        let script = std::path::PathBuf::from(home).join(".local/bin/sway-workspace-swipe");
+        if let Err(e) = std::process::Command::new(script)
+            .arg(direction).arg("--output").arg(output).spawn()
+        {
+            warn(format_args!("workspace swipe helper: {e}"));
+        }
+        // On a deliberate workspace switch, reflect its resulting focus rather
+        // than restoring the workspace focused when overview first opened.
+        self.initial_focus = None;
     }
 
     fn apply(&mut self, action: &Action) {
@@ -528,7 +736,11 @@ impl LayerShellHandler for App {
         _serial: u32,
     ) {
         let Some(i) = self.surface_index(layer.wl_surface()) else { return };
-        self.surfaces[i].size = Some((configure.new_size.0.max(1), configure.new_size.1.max(1)));
+        let size = Some((configure.new_size.0.max(1), configure.new_size.1.max(1)));
+        if self.surfaces[i].size != size && self.workspace_drag.is_some() {
+            self.cancel_workspace_drag();
+        }
+        self.surfaces[i].size = size;
         self.rebuild();
     }
 }
@@ -595,7 +807,10 @@ impl OutputHandler for App {
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.cancel_workspace_drag();
+        self.exit = true;
+    }
 }
 
 impl SeatHandler for App {
@@ -635,12 +850,16 @@ impl SeatHandler for App {
         // timer from inside the event loop's dispatch, which calloop panics on.
         // The dead object lives until exit.
         if capability == Capability::Keyboard {
+            self.super_down = false;
             self.keyboard = None;
         }
         if capability == Capability::Pointer
             && let Some(p) = self.pointer.take()
         {
             p.release();
+            self.cancel_workspace_drag();
+            self.drag = None;
+            self.drop_workspace = None;
         }
     }
 
@@ -668,6 +887,7 @@ impl KeyboardHandler for App {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
+        self.super_down = false;
     }
 
     fn press_key(
@@ -709,10 +929,11 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: Modifiers,
+        modifiers: Modifiers,
         _: RawModifiers,
         _: u32,
     ) {
+        self.super_down = modifiers.logo;
     }
 }
 
@@ -725,24 +946,47 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
-            if self.exit {
-                break;
-            }
+            if self.exit { break; }
             let Some(i) = self.surface_index(&event.surface) else { continue };
             let (x, y) = (event.position.0 as f32, event.position.1 as f32);
             match event.kind {
                 PointerEventKind::Enter { .. } => self.pointer_surface = Some(i),
-                // Moving over a window selects it. Enter alone does not, so a
-                // resting mouse leaves the focused window selected on open.
                 PointerEventKind::Motion { .. } => {
                     self.pointer_surface = Some(i);
-                    let action = input::motion(&self.surfaces[i].scene, i, x, y);
-                    self.apply(&action);
+                    if self.workspace_drag.is_some() {
+                        self.workspace_drag_motion(i, x, y);
+                    } else if self.drag.is_some() {
+                        self.drag_motion(i, x, y);
+                    } else {
+                        let action = input::motion(&self.surfaces[i].scene, i, x, y);
+                        self.apply(&action);
+                    }
                 }
                 PointerEventKind::Leave { .. } => self.pointer_surface = None,
                 PointerEventKind::Press { button: BTN_LEFT, .. } => {
-                    let action = input::click(&self.surfaces[i].scene, x, y);
-                    self.apply(&action);
+                    let scene = &self.surfaces[i].scene;
+                    let window = scene.hit(x, y);
+                    let workspace = scene.workspace_at(x, y);
+                    if (self.super_down || window.is_none()) && workspace.is_some() {
+                        let id = scene.workspaces[workspace.unwrap()].id;
+                        if let Some(start) = self.global_pointer(i, x, y) {
+                            self.workspace_drag = Some(WorkspaceDrag { id, start, active: false });
+                        }
+                    } else if let Some(window) = window {
+                        let id = self.surfaces[i].scene.windows[window].id;
+                        let source_workspace = self.surfaces[i].scene.windows[window].workspace;
+                        self.drag = Some(Drag { id, source: i, source_workspace, start: (x, y), active: false });
+                    } else {
+                        let action = input::click(&self.surfaces[i].scene, x, y);
+                        self.apply(&action);
+                    }
+                }
+                PointerEventKind::Release { button: BTN_LEFT, .. } => {
+                    if self.workspace_drag.is_some() {
+                        self.workspace_drag_release(i, x, y);
+                    } else {
+                        self.drag_release(i, x, y);
+                    }
                 }
                 _ => {}
             }

@@ -210,7 +210,8 @@ impl App {
         let parent = s.layer.wl_surface().clone();
         s.tiles.retain(|id, _| s.scene.windows.iter().any(|w| w.id == *id));
         let mut below = parent.clone();
-        for win in &s.scene.windows {
+        for index in s.scene.drawing_order() {
+            let win = &s.scene.windows[index];
             let place = snap(win.rect);
             if place.w < 1 || place.h < 1 {
                 s.tiles.remove(&win.id);
